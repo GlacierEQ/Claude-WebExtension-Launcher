@@ -9,6 +9,26 @@ A custom installer for Claude Desktop that includes built-in extensions (and the
 - This project is neither affiliated with nor endorsed by Anthropic
 - You are responsible for ensuring your use complies with all applicable terms and agreements
 
+## Multi-instance (new)
+
+You can now run multiple desktop client instances by just launching the client with --instance [name], eg --instance work.
+Useful if you want to have multiple windows open, or if you have multiple accounts.
+
+## Known limitations
+
+### Multi-instance login requires using a code
+When using `--instance` to run additional instances, those instances are not registered to handle Claude's magic links. When logging in to a non-default instance, use the **"Use a login code instead"** option to log in with a one-time code.
+
+### Windows requires admin perms
+This is to make Cowork function. The app will block cowork if the application is not inside of C:\Program Files\WindowsApps, which requires admin permissions to be written to and read from.
+
+### Cowork does not work on MacOS (Corrupt install)
+This is because the app is signed, and cowork checks for the signature.
+On windows, this is circumvented by not modifying the exe and instead using a .dll, but that cannot be done on MacOS.
+
+
+I would recommend keeping a separate, unmodified install for it.
+
 ## Overview
 
 This installer generates a modified version of the Claude Desktop client with extension support enabled. It creates a standalone installation that can coexist with the official Claude Desktop client, automatically keeping both the client and extensions up to date.
@@ -22,6 +42,12 @@ This can happen due to reasons I'm not really sure of. Restarting the applicatio
 ### Windows defender flags it as malware
 
 Yep, Waca- etc are a pretty common false positive. Pyinstaller-built exes used to also trigger it. There isn't really anything I can do about that.
+<details>
+<summary>How does patching work on windows?</summary>
+Basically, it uses the fact that exes will load DLLs that are next to the exe first, to load a modified version.dll.
+Its source code is inside the ClaudeDLL folder, but it basically just tells the exe that whatever hash app.asar has, it's the right one.
+It's a way to circumvent the asar integrity check without modifying the exe itself, which is what I used to do (and it broke cowork).
+</details>
 
 ### Refuses to open on MacOS (Insecure/Not Verified)
 You might need to go to Settings -> Privacy and Security and click "Open anyway".
@@ -40,7 +66,7 @@ On first launch, you might see a crash dialog about the network service. This is
 - **Windows** - Windows 10/11
 
 ### Quick Start
-Download the latest installer from [Releases](../../releases) and run it. The installer will handle everything automatically.
+Download the latest installer from [Releases](https://github.com/lugia19/Claude-WebExtension-Launcher/releases) and run it. The installer will handle everything automatically.
 
 ## Features
 
@@ -49,7 +75,7 @@ The installer provides:
 - **Latest Claude Desktop** - Automatically downloads and updates to the most recent supported version
 - **Custom Icon** - Distinguishes your extended installation from the standard client
 - **Extension Support** - Unpacks resources and enables extension loading capabilities. You can add your own unpacked extensions in the extensions folder. NOTE: Most extensions will need to be adapted to work.
-- **Pre-installed Extensions** - Includes Usage Tracker (and Toolbox coming soon, including all my userscripts from [here](https://github.com/lugia19/Claude-Toolbox))
+- **Pre-installed Extensions** - Includes [Usage Tracker](https://github.com/lugia19/Claude-Usage-Extension/) and [Claude QoL](https://github.com/lugia19/Claude-QoL)
 - **Automatic Updates** - Keeps both the client and extensions current
 - **Standalone Installation** - Runs independently alongside the official Claude Desktop
 
@@ -62,7 +88,7 @@ The installer provides:
 
 ## Privacy
 
-The installer only modifies your local Claude Desktop installation. No data is collected or transmitted by the installer itself. Individual extensions may have their own privacy policies.
+The installer only creates a local modified Claude Desktop installation. No data is collected or transmitted by the installer itself. Individual extensions may have their own privacy policies.
 
 ## Troubleshooting
 

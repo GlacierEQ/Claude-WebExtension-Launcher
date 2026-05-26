@@ -1,7 +1,6 @@
 package patcher
 
 import (
-	"archive/zip"
 	"bytes"
 	"claude-webext-patcher/utils"
 	"embed"
@@ -13,9 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
-	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -23,10 +19,11 @@ import (
 var EmbeddedFS embed.FS
 
 const (
-	windowsReleasesURL = "https://storage.googleapis.com/osprey-downloads-c02f6a0d-347c-492b-a752-3e0651722e97/nest-win-x64/RELEASES"
-	macosReleasesURL   = "https://storage.googleapis.com/osprey-downloads-c02f6a0d-347c-492b-a752-3e0651722e97/nest/update_manifest.json"
+	windowsReleasesURL = "https://downloads.claude.ai/releases/win32/x64/RELEASES"
+	macosReleasesURL   = "https://downloads.claude.ai/releases/darwin/universal/RELEASES.json"
 	appFolderName      = "app-latest"
 	KeepNupkgFiles     = false
+	PatchVersion       = "5"
 )
 
 type MacOSManifest struct {
@@ -40,66 +37,131 @@ type MacOSManifest struct {
 }
 
 type Patch struct {
-	Files []string
-	Func  func(content []byte) []byte
+	Files   []string
+	Exclude []string
+	Func    func(content []byte) []byte
 }
 
 var supportedVersions = map[string][]Patch{
 	// Generic patch that should work for most versions
 	"generic": {
 		{
-			// Use pattern to match all index*.js files
-			Files: []string{".vite/build/index*.js"},
+			Files:   []string{".vite/build/index*.js"},
+			Exclude: []string{"index.pre"},
 			Func: func(content []byte) []byte {
 				return patch_generic(content)
 			},
 		},
+		{
+			// Patch index.pre.js to redirect userData path for instance isolation
+			Files: []string{".vite/build/index.pre*.js"},
+			Func: func(content []byte) []byte {
+				return patch_index_pre(content)
+			},
+		},
 	},
 	// Add version-specific overrides here when needed
-	// Example:
-	// "0.13.0": {
-	//     {
-	//         Files: []string{"specific-file.js"},
-	//         Func: func(content []byte) []byte {
-	//             return patch_v0_13_0(content)
-	//         },
-	//     },
-	// },
 }
 
-// List of versions verified to work with generic patches
-var versionsVerifiedGenericCompatible = []string{
-	"0.12.125",
-	"0.12.112",
-	"0.12.55",
-	"0.13.11",
-	"0.13.19",
-}
+// Cached verified versions list (loaded on first use)
+var versionsVerifiedGenericCompatible []string
+
+const verifiedVersionsURL = "https://raw.githubusercontent.com/lugia19/Claude-WebExtension-Launcher/master/resources/verified_versions.json"
 
 var (
-	AppFolder       = utils.ResolvePath(appFolderName)
+	AppFolder       string
+	installBaseDir  string
 	appResourcesDir string
 	appExePath      string
 )
 
+var (
+	asarCmd       string
+	jsBeautifyCmd string
+)
+
 func init() {
-	if runtime.GOOS == "darwin" {
-		appResourcesDir = filepath.Join(AppFolder, "Claude.app", "Contents", "Resources")
-		appExePath = filepath.Join(AppFolder, "Claude.app", "Contents", "MacOS", "Claude")
-	} else {
-		appResourcesDir = filepath.Join(AppFolder, "resources")
-		appExePath = filepath.Join(AppFolder, "claude.exe")
+	initPaths()
+}
+
+func InstallBaseDir() string {
+	return installBaseDir
+}
+
+// ForceRedownload deletes the version file and forces a full re-download and re-patch.
+func ForceRedownload() error {
+	claudeVersionFile := filepath.Join(installBaseDir, "claude-version.txt")
+	os.Remove(claudeVersionFile)
+	return EnsurePatched(true)
+}
+
+// Load verified versions from GitHub, with fallback to embedded JSON
+func loadVerifiedVersions() []string {
+	// Try fetching from GitHub first
+	resp, err := http.Get(verifiedVersionsURL)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == 200 {
+			body, err := io.ReadAll(resp.Body)
+			if err == nil {
+				var versions []string
+				if err := json.Unmarshal(body, &versions); err == nil {
+					fmt.Printf("Loaded %d verified versions from GitHub\n", len(versions))
+					return versions
+				}
+			}
+		}
 	}
+
+	// Fallback to embedded JSON
+	fmt.Println("Falling back to embedded verified versions list")
+	embeddedData, err := EmbeddedFS.ReadFile("resources/verified_versions.json")
+	if err != nil {
+		fmt.Printf("Warning: Could not load embedded verified versions: %v\n", err)
+		return []string{}
+	}
+
+	var versions []string
+	if err := json.Unmarshal(embeddedData, &versions); err != nil {
+		fmt.Printf("Warning: Could not parse embedded verified versions: %v\n", err)
+		return []string{}
+	}
+
+	fmt.Printf("Loaded %d verified versions from embedded file\n", len(versions))
+	return versions
 }
 
 // Check if a version is verified to work with generic patches
-func isVersionVerified(version string) bool {
+func IsVersionVerified(version string) bool {
+	// Load versions on first use
+	if versionsVerifiedGenericCompatible == nil {
+		versionsVerifiedGenericCompatible = loadVerifiedVersions()
+	}
+
 	for _, v := range versionsVerifiedGenericCompatible {
 		if v == version {
 			return true
 		}
 	}
 	return false
+}
+
+func DeploySentinelExtension() error {
+	sentinelDir := filepath.Join(utils.ResolveInstallPath("web-extensions"), "sentinel")
+	os.MkdirAll(sentinelDir, 0755)
+
+	for _, name := range []string{"manifest.json", "content.js"} {
+		data, err := EmbeddedFS.ReadFile("resources/sentinel_extension/" + name)
+		if err != nil {
+			return fmt.Errorf("reading embedded sentinel file %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(sentinelDir, name), data, 0644); err != nil {
+			return fmt.Errorf("writing sentinel file %s: %v", name, err)
+		}
+	}
+
+	fmt.Println("Deployed sentinel extension.")
+	return nil
 }
 
 // Patch functions
@@ -134,24 +196,67 @@ func readCombinedInjection(version string, filenames []string) (string, error) {
 	return combined.String(), nil
 }
 
-func patch_generic(content []byte) []byte {
+func patch_index_pre(content []byte) []byte {
 	contentStr := string(content)
 
-	// First, find the injection point
-	returnPattern := regexp.MustCompile(`return\s*.*?(\w+)\.on\("resize"`)
-	matches := returnPattern.FindStringSubmatch(contentStr)
-	if matches == nil || len(matches) < 2 {
-		fmt.Printf("Warning: Could not find injection point (return.*.on(\"resize\"))\n")
+	// Find "use strict" at top of file
+	useStrictPattern := `"use strict";`
+	idx := strings.Index(contentStr, useStrictPattern)
+	if idx == -1 {
+		fmt.Printf("Warning: Could not find \"use strict\" in index.pre file\n")
 		return content
 	}
 
-	// Extract mainWindow variable name from the pattern
-	mainWindowVar := matches[1]
+	// Load the userData injection
+	injection, err := readInjection("generic", "instance_userdata.js")
+	if err != nil {
+		fmt.Printf("Warning: %v\n", err)
+		return content
+	}
+
+	// Insert after "use strict";
+	insertPos := idx + len(useStrictPattern)
+	contentStr = contentStr[:insertPos] + "\n" + injection + "\n" + contentStr[insertPos:]
+
+	return []byte(contentStr)
+}
+
+func patch_generic(content []byte) []byte {
+	contentStr := string(content)
+
+	// First, find the injection point — match any X.on("resize" and pick the
+	// one that is NOT on a line containing "fullScreen" (which is a different call).
+	resizePattern := regexp.MustCompile(`(\w+)\.on\("resize"`)
+	allMatches := resizePattern.FindAllStringSubmatchIndex(contentStr, -1)
+	var mainWindowVar string
+	var injectionIndex int
+	found := false
+	for _, loc := range allMatches {
+		lineStart := strings.LastIndex(contentStr[:loc[0]], "\n") + 1
+		lineEnd := strings.Index(contentStr[loc[0]:], "\n")
+		if lineEnd == -1 {
+			lineEnd = len(contentStr)
+		} else {
+			lineEnd += loc[0]
+		}
+		line := contentStr[lineStart:lineEnd]
+		if strings.Contains(strings.ToLower(line), "fullscreen") {
+			continue
+		}
+		mainWindowVar = contentStr[loc[2]:loc[3]]
+		injectionIndex = loc[0]
+		found = true
+		break
+	}
+	if !found {
+		fmt.Printf("Warning: Could not find injection point (*.on(\"resize\") without fullScreen)\n")
+		return content
+	}
+
 	fmt.Printf("Detected mainWindow variable: %s\n", mainWindowVar)
 
 	// Find the webView variable by looking for pattern like: variableName.webContents.on("dom-ready"
 	// We need to find this before the injection point
-	injectionIndex := returnPattern.FindStringIndex(contentStr)[0]
 	contentBeforeInjection := contentStr[:injectionIndex]
 
 	// Look for webView pattern
@@ -165,6 +270,26 @@ func patch_generic(content []byte) []byte {
 	} else {
 		fmt.Printf("Warning: Could not detect webView variable, falling back to 'r'\n")
 		webViewVar = "r" // Fallback to common default
+	}
+
+	// Replace requestSingleInstanceLock calls with our wrapper BEFORE injecting
+	// the helper function (which itself contains a requestSingleInstanceLock call)
+	lockPattern := regexp.MustCompile(`\w+\.app\.requestSingleInstanceLock\(\)`)
+	contentStr = lockPattern.ReplaceAllString(contentStr, "__modifiedLock()")
+
+	// Inject instance lock helper function after "use strict"
+	useStrictPattern := `"use strict";`
+	useStrictIdx := strings.Index(contentStr, useStrictPattern)
+	if useStrictIdx != -1 {
+		lockInjection, err := readInjection("generic", "instance_lock.js")
+		if err != nil {
+			fmt.Printf("Warning: %v\n", err)
+		} else {
+			insertPos := useStrictIdx + len(useStrictPattern)
+			contentStr = contentStr[:insertPos] + "\n" + lockInjection + "\n" + contentStr[insertPos:]
+		}
+	} else {
+		fmt.Printf("Warning: Could not find \"use strict\" for lock injection\n")
 	}
 
 	// Load all injection files
@@ -185,10 +310,30 @@ func patch_generic(content []byte) []byte {
 	injection = strings.ReplaceAll(injection, "PLACEHOLDER_MAINWINDOW", mainWindowVar)
 	injection = strings.ReplaceAll(injection, "PLACEHOLDER_WEBVIEW", webViewVar)
 
-	// Insert the injection at the injection point
-	loc := returnPattern.FindStringIndex(contentStr)
-	if loc != nil {
-		contentStr = contentStr[:loc[0]] + "\n" + injection + "\n" + contentStr[loc[0]:]
+	// Re-find the injection point (content may have shifted from earlier insertions)
+	allMatches = resizePattern.FindAllStringSubmatchIndex(contentStr, -1)
+	for _, loc := range allMatches {
+		lineStart := strings.LastIndex(contentStr[:loc[0]], "\n") + 1
+		lineEnd := strings.Index(contentStr[loc[0]:], "\n")
+		if lineEnd == -1 {
+			lineEnd = len(contentStr)
+		} else {
+			lineEnd += loc[0]
+		}
+		line := contentStr[lineStart:lineEnd]
+		if strings.Contains(strings.ToLower(line), "fullscreen") {
+			continue
+		}
+		// Insert after the closest preceding semicolon to avoid injecting
+		// inside a comma-separated expression.
+		insertPos := strings.LastIndex(contentStr[:loc[0]], ";")
+		if insertPos == -1 {
+			insertPos = loc[0]
+		} else {
+			insertPos++ // after the semicolon
+		}
+		contentStr = contentStr[:insertPos] + "\n" + injection + "\n" + contentStr[insertPos:]
+		break
 	}
 
 	// Second injection point - add chrome-extension: to the array
@@ -198,11 +343,6 @@ func patch_generic(content []byte) []byte {
 
 	return []byte(contentStr)
 }
-
-var (
-	asarCmd       string
-	jsBeautifyCmd string
-)
 
 func ensureTools() error {
 	// Check if node exists and get version
@@ -227,14 +367,10 @@ func ensureTools() error {
 	fmt.Printf("Found Node.js %s\n", versionStr)
 
 	// Set tool paths
-	nodeModulesPath := utils.ResolvePath(filepath.Join("node_modules", ".bin"))
+	nodeModulesPath := utils.ResolveInstallPath(filepath.Join("node_modules", ".bin"))
 	asarCmd = filepath.Join(nodeModulesPath, "asar")
 	jsBeautifyCmd = filepath.Join(nodeModulesPath, "js-beautify")
-
-	if runtime.GOOS == "windows" {
-		asarCmd += ".ps1"
-		jsBeautifyCmd += ".ps1"
-	}
+	applyPlatformToolSuffix()
 
 	// Install locally if needed
 	if _, err := os.Stat(asarCmd); os.IsNotExist(err) {
@@ -246,7 +382,12 @@ func ensureTools() error {
 			asarPackage = "@electron/asar"
 		}
 
-		installDir := utils.ResolvePath(".")
+		installDir := utils.ResolveInstallPath(".")
+		// Ensure a package.json exists so npm doesn't walk up into the locked WindowsApps directory
+		pkgJsonPath := filepath.Join(installDir, "package.json")
+		if _, err := os.Stat(pkgJsonPath); os.IsNotExist(err) {
+			os.WriteFile(pkgJsonPath, []byte("{}"), 0644)
+		}
 		cmd := exec.Command("npm", "install", "--prefix", installDir, "--no-save", asarPackage, "js-beautify")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -258,325 +399,31 @@ func ensureTools() error {
 	return nil
 }
 
-func getLatestVersion() (string, string, error) {
-	fmt.Printf("Getting latest version for OS: %s\n", runtime.GOOS)
-
-	if runtime.GOOS == "darwin" {
-		// Parse macOS manifest
-		fmt.Printf("Fetching macOS manifest from: %s\n", macosReleasesURL)
-		resp, err := http.Get(macosReleasesURL)
-		if err != nil {
-			return "", "", fmt.Errorf("fetching macOS manifest: %v", err)
-		}
-		defer resp.Body.Close()
-
-		// Read the response body for debugging
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", "", fmt.Errorf("reading macOS manifest body: %v", err)
-		}
-
-		var manifest MacOSManifest
-		if err := json.Unmarshal(body, &manifest); err != nil {
-			// Print first 500 chars for debugging
-			debugLen := len(body)
-			if debugLen > 500 {
-				debugLen = 500
-			}
-			fmt.Printf("Failed to parse manifest. First %d chars: %s\n", debugLen, string(body[:debugLen]))
-			return "", "", fmt.Errorf("parsing macOS manifest: %v", err)
-		}
-
-		// Get the current/latest release
-		if manifest.CurrentRelease != "" {
-			// Find the URL for the current release
-			for _, release := range manifest.Releases {
-				if release.Version == manifest.CurrentRelease {
-					return release.Version, release.UpdateTo.URL, nil
-				}
-			}
-		}
-
-		// Fallback: if currentRelease is not set or not found, use the first release
-		if len(manifest.Releases) > 0 {
-			return manifest.Releases[0].Version, manifest.Releases[0].UpdateTo.URL, nil
-		}
-
-		return "", "", fmt.Errorf("no releases available in macOS manifest")
-	} else {
-		// Windows - parse RELEASES file to find the latest version
-		resp, err := http.Get(windowsReleasesURL)
-		if err != nil {
-			return "", "", fmt.Errorf("fetching Windows releases: %v", err)
-		}
-		defer resp.Body.Close()
-
-		releasesText, _ := io.ReadAll(resp.Body)
-
-		lines := strings.Split(string(releasesText), "\n")
-
-		// Find the latest version from the RELEASES file
-		// The format is typically: SHA1 filename size
-		var versions []struct {
-			version  string
-			url      string
-			filename string
-		}
-
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			if strings.Contains(line, "AnthropicClaude-") && strings.Contains(line, "-full.nupkg") {
-				// Extract version from filename
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					filename := parts[1]
-					// Extract version from AnthropicClaude-X.Y.Z-full.nupkg
-					versionStart := strings.Index(filename, "AnthropicClaude-") + len("AnthropicClaude-")
-					versionEnd := strings.Index(filename, "-full.nupkg")
-					if versionStart > 0 && versionEnd > versionStart {
-						version := filename[versionStart:versionEnd]
-						url := strings.Replace(windowsReleasesURL, "RELEASES", filename, 1)
-						versions = append(versions, struct {
-							version  string
-							url      string
-							filename string
-						}{version, url, filename})
-					}
-				}
-			}
-		}
-
-		if len(versions) == 0 {
-			fmt.Printf("ERROR: No valid releases found in RELEASES file\n")
-			return "", "", fmt.Errorf("no releases found in Windows RELEASES file")
-		}
-
-		// Sort versions to find the latest (newest first)
-		sort.Slice(versions, func(i, j int) bool {
-			partsI := strings.Split(versions[i].version, ".")
-			partsJ := strings.Split(versions[j].version, ".")
-
-			for k := 0; k < len(partsI) && k < len(partsJ); k++ {
-				numI, _ := strconv.Atoi(partsI[k])
-				numJ, _ := strconv.Atoi(partsJ[k])
-
-				if numI != numJ {
-					return numI > numJ
-				}
-			}
-
-			return len(partsI) > len(partsJ)
-		})
-
-		// Use the latest version
-		latest := versions[0]
-		fmt.Printf("Selected latest version: %s, URL: %s\n", latest.version, latest.url)
-		return latest.version, latest.url, nil
-	}
-}
-
-func downloadAndExtract(version, downloadURL string) error {
-	var newVersionZipName string
-	if runtime.GOOS == "darwin" {
-		newVersionZipName = fmt.Sprintf("Claude-%s.zip", version)
-	} else {
-		newVersionZipName = fmt.Sprintf("AnthropicClaude-%s-full.nupkg", version)
-	}
-
-	// Define the download path based on whether we keep files or use temp
-	var newVersionDownloadPath string
-	if KeepNupkgFiles {
-		newVersionDownloadPath = utils.ResolvePath(newVersionZipName)
-	} else {
-		newVersionDownloadPath = utils.ResolvePath(newVersionZipName + ".tmp")
-	}
-
-	// Check if file already exists when KeepNupkgFiles is enabled
-	fileExists := false
-	fullPath := utils.ResolvePath(newVersionZipName)
-	if _, err := os.Stat(fullPath); err == nil {
-		fileExists = true
-	}
-
-	if KeepNupkgFiles && fileExists {
-		fmt.Printf("Using existing file: %s\n", newVersionZipName)
-	} else {
-		// Download if file doesn't exist or if we're not keeping files
-		fmt.Printf("Downloading from: %s\n", downloadURL)
-
-		resp, err := http.Get(downloadURL)
-		if err != nil {
-			return fmt.Errorf("downloading: %v", err)
-		}
-		defer resp.Body.Close()
-
-		// Use the already defined download path
-		outFile, err := os.Create(newVersionDownloadPath)
-		if err != nil {
-			return fmt.Errorf("creating file: %v", err)
-		}
-		_, err = io.Copy(outFile, resp.Body)
-		outFile.Close()
-		if err != nil {
-			return fmt.Errorf("saving file: %v", err)
-		}
-		fmt.Printf("Downloaded: %s\n", newVersionDownloadPath)
-	}
-
-	// Extract
-	fmt.Println("Extracting...")
-	os.RemoveAll(AppFolder)
-	os.MkdirAll(AppFolder, 0755)
-
-	zipReader, err := zip.OpenReader(newVersionDownloadPath)
-	if err != nil {
-		return fmt.Errorf("opening archive: %v", err)
-	}
-	// Don't defer close - we need to close before deleting temp file
-
-	for _, f := range zipReader.File {
-		var relativePath string
-
-		if runtime.GOOS == "darwin" {
-			// For macOS, keep the full .app bundle structure
-			relativePath = f.Name
-		} else {
-			// Windows - only extract files from lib/net45/
-			if !strings.HasPrefix(f.Name, "lib/net45/") {
-				continue
-			}
-			relativePath = strings.TrimPrefix(f.Name, "lib/net45/")
-		}
-
-		if relativePath == "" {
-			continue
-		}
-
-		path := filepath.Join(AppFolder, relativePath)
-
-		// Handle PowerShell Compress-Archive's broken directory entries
-		normalizedName := strings.ReplaceAll(f.Name, "\\", "/")
-		isDirectory := f.FileInfo().IsDir() || (f.UncompressedSize64 == 0 && (strings.HasSuffix(normalizedName, "/") || strings.HasSuffix(f.Name, "\\")))
-
-		if isDirectory {
-			os.MkdirAll(path, 0755)
-			continue
-		}
-
-		// Skip if path already exists as a directory (created by earlier MkdirAll)
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			continue
-		}
-
-		os.MkdirAll(filepath.Dir(path), 0755)
-
-		// Check if this is a symlink on macOS
-		isSymlink := runtime.GOOS == "darwin" &&
-			(f.ExternalAttrs>>16)&0170000 == 0120000
-
-		if isSymlink {
-			// Read the symlink target
-			src, err := f.Open()
-			if err != nil {
-				continue
-			}
-			linkTarget, err := io.ReadAll(src)
-			src.Close()
-
-			if err == nil && len(linkTarget) > 0 {
-				linkStr := string(linkTarget)
-				// Create the symlink
-				os.Remove(path) // Remove if exists
-				if err := os.Symlink(linkStr, path); err == nil {
-					fmt.Printf("Created symlink: %s -> %s\n", filepath.Base(path), linkStr)
-				} else {
-					fmt.Printf("Failed to create symlink %s: %v\n", path, err)
-				}
-				continue
-			}
-		}
-
-		// Regular file extraction
-		src, _ := f.Open()
-		dst, _ := os.Create(path)
-		io.Copy(dst, src)
-		dst.Close()
-		src.Close()
-	}
-
-	// Close the zip reader before attempting to delete temp file
-	zipReader.Close()
-
-	// macOS specific: Make sure the executable has execute permissions
-	if runtime.GOOS == "darwin" {
-		// Make the main executable executable
-		claudeExec := filepath.Join(AppFolder, "Claude.app", "Contents", "MacOS", "Claude")
-		if err := os.Chmod(claudeExec, 0755); err != nil {
-			fmt.Printf("Warning: Could not set executable permissions: %v\n", err)
-		}
-
-		// Also make helper apps executable
-		helpers := []string{
-			"Claude Helper",
-			"Claude Helper (GPU)",
-			"Claude Helper (Plugin)",
-			"Claude Helper (Renderer)",
-		}
-		for _, helper := range helpers {
-			helperPath := filepath.Join(AppFolder, "Claude.app", "Contents", "Frameworks",
-				helper+".app", "Contents", "MacOS", helper)
-			if err := os.Chmod(helperPath, 0755); err != nil {
-				// Don't warn for each one, they might not all exist
-				continue
-			}
-		}
-
-		// Also make chrome_crashpad_handler executable
-		crashpadPath := filepath.Join(AppFolder, "Claude.app", "Contents", "Frameworks",
-			"Electron Framework.framework", "Helpers", "chrome_crashpad_handler")
-		if err := os.Chmod(crashpadPath, 0755); err != nil {
-			// Don't warn, might not exist in all versions
-		}
-
-		// Delete ShipIt to prevent self-updates
-		shipItPath := filepath.Join(AppFolder, "Claude.app", "Contents", "Frameworks", "Squirrel.framework", "Resources", "ShipIt")
-		if err := os.Remove(shipItPath); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("Warning: Could not remove ShipIt: %v\n", err)
-		} else {
-			fmt.Println("Removed ShipIt to prevent self-updates")
-		}
-	}
-
-	// Delete the archive file only if KeepNupkgFiles is false
-	if !KeepNupkgFiles {
-		os.Remove(newVersionDownloadPath)
-	} else {
-		fmt.Printf("Keeping archive file: %s\n", newVersionZipName)
-	}
-
-	return nil
+func canFallbackToExisting() bool {
+	_, err := os.Stat(appExePath)
+	return err == nil
 }
 
 func EnsurePatched(forceUpdate bool) error {
+	if err := prepareInstallDir(); err != nil {
+		return fmt.Errorf("setting up install directory: %v", err)
+	}
+
 	if err := ensureTools(); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Get current version
+	// Get current version (stored at installBaseDir level, not inside AppFolder)
 	currentVersion := ""
-	claudeVersionFile := filepath.Join(AppFolder, "claude-version.txt")
+	claudeVersionFile := filepath.Join(installBaseDir, "claude-version.txt")
 	if data, err := os.ReadFile(claudeVersionFile); err == nil {
 		currentVersion = strings.TrimSpace(string(data))
 		fmt.Printf("Current version: %s\n", currentVersion)
 	}
 
 	// Get latest version and download URL
-	newestVersion, downloadURL, err := getLatestVersion()
+	newestVersion, downloadURL, err := GetLatestVersion()
 	if err != nil {
 		// If we have an existing installation, continue using it
 		if currentVersion != "" {
@@ -597,7 +444,7 @@ func EnsurePatched(forceUpdate bool) error {
 	fmt.Printf("Latest version: %s\n", newestVersion)
 
 	// Check if version is verified
-	versionVerified := isVersionVerified(newestVersion)
+	versionVerified := IsVersionVerified(newestVersion)
 
 	// Decide whether to update based on verification status and existing installation
 	shouldUpdate := false
@@ -637,10 +484,15 @@ func EnsurePatched(forceUpdate bool) error {
 	}
 
 	// Update if needed
+	patchVersionFile := filepath.Join(installBaseDir, "patch-version.txt")
 	if shouldUpdate {
 		fmt.Printf("Updating to %s...\n", newestVersion)
 
 		if err := downloadAndExtract(newestVersion, downloadURL); err != nil {
+			if canFallbackToExisting() {
+				fmt.Printf("Warning: download/extract failed (%v), continuing with existing installation.\n", err)
+				return nil
+			}
 			return err
 		}
 
@@ -649,10 +501,42 @@ func EnsurePatched(forceUpdate bool) error {
 
 		// Apply patches
 		if err := applyPatches(newestVersion); err != nil {
+			if canFallbackToExisting() {
+				fmt.Printf("Warning: patching failed (%v), continuing with existing installation.\n", err)
+				return nil
+			}
 			return fmt.Errorf("applying patches: %v", err)
 		}
-	} else if currentVersion == newestVersion {
-		fmt.Println("Already on the latest version")
+		os.WriteFile(patchVersionFile, []byte(PatchVersion), 0644)
+	} else {
+		if currentVersion == newestVersion {
+			fmt.Println("Already on the latest version")
+		}
+
+		// Check if injection code needs updating
+		currentPatchVersion := ""
+		if data, err := os.ReadFile(patchVersionFile); err == nil {
+			currentPatchVersion = strings.TrimSpace(string(data))
+		}
+		if currentPatchVersion != PatchVersion {
+			fmt.Printf("Patch version changed (%s -> %s), re-downloading and re-patching...\n", currentPatchVersion, PatchVersion)
+			if err := downloadAndExtract(newestVersion, downloadURL); err != nil {
+				if canFallbackToExisting() {
+					fmt.Printf("Warning: re-download failed (%v), continuing with existing installation.\n", err)
+					return nil
+				}
+				return err
+			}
+			if err := applyPatches(newestVersion); err != nil {
+				if canFallbackToExisting() {
+					fmt.Printf("Warning: re-patching failed (%v), continuing with existing installation.\n", err)
+					return nil
+				}
+				return fmt.Errorf("applying patches: %v", err)
+			}
+			os.WriteFile(claudeVersionFile, []byte(newestVersion), 0644)
+			os.WriteFile(patchVersionFile, []byte(PatchVersion), 0644)
+		}
 	}
 
 	return nil
@@ -666,13 +550,7 @@ func applyPatchToFile(filePath string, content []byte, patchFunc func([]byte) []
 	// Beautify JS files if needed
 	if strings.HasSuffix(fileName, ".js") {
 		if !bytes.Contains(content, []byte("/* CLAUDE-MANAGER-BEAUTIFIED */")) {
-			// Beautify the file
-			var beautifyCmd *exec.Cmd
-			if runtime.GOOS == "windows" && strings.HasSuffix(jsBeautifyCmd, ".ps1") {
-				beautifyCmd = exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-File", jsBeautifyCmd, filePath, "-o", filePath)
-			} else {
-				beautifyCmd = exec.Command(jsBeautifyCmd, filePath, "-o", filePath)
-			}
+			beautifyCmd := jsBeautifyCommand(filePath, "-o", filePath)
 			if err := beautifyCmd.Run(); err != nil {
 				fmt.Printf("Warning: Could not beautify %s: %v\n", fileName, err)
 			} else {
@@ -725,14 +603,7 @@ func applyPatches(version string) error {
 	fmt.Printf("Running command: %s\n", asarCmd)
 	fmt.Printf("Arguments: extract %s %s\n", asarPath, tempDir)
 
-	var cmd *exec.Cmd
-	// On Windows, .ps1 files need to be run through PowerShell
-	if runtime.GOOS == "windows" && strings.HasSuffix(asarCmd, ".ps1") {
-		fmt.Println("Using PowerShell for Windows .ps1 file")
-		cmd = exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-File", asarCmd, "extract", asarPath, tempDir)
-	} else {
-		cmd = exec.Command(asarCmd, "extract", asarPath, tempDir)
-	}
+	cmd := asarCommand("extract", asarPath, tempDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Printf("Command failed with error: %v\n", err)
@@ -763,6 +634,18 @@ func applyPatches(version string) error {
 
 				// Apply patch to all matching files
 				for _, matchedFile := range matches {
+					baseName := filepath.Base(matchedFile)
+					excluded := false
+					for _, ex := range patch.Exclude {
+						if strings.Contains(baseName, ex) {
+							excluded = true
+							break
+						}
+					}
+					if excluded {
+						continue
+					}
+
 					relPath, _ := filepath.Rel(tempDir, matchedFile)
 					fmt.Printf("Trying matched file: %s\n", relPath)
 
@@ -812,88 +695,18 @@ func applyPatches(version string) error {
 	fmt.Printf("Running command: %s\n", asarCmd)
 	fmt.Printf("Arguments: pack %s %s\n", tempDir, asarPath)
 
-	// On Windows, .ps1 files need to be run through PowerShell
-	if runtime.GOOS == "windows" && strings.HasSuffix(asarCmd, ".ps1") {
-		fmt.Println("Using PowerShell for Windows .ps1 file")
-		cmd = exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-File", asarCmd, "pack", tempDir, asarPath)
-	} else {
-		cmd = exec.Command(asarCmd, "pack", tempDir, asarPath)
-	}
+	cmd = asarCommand("pack", tempDir, asarPath)
 	output2, err2 := cmd.CombinedOutput()
 	if err2 != nil {
-		fmt.Printf("Command failed with error: %v\n", err)
+		fmt.Printf("Command failed with error: %v\n", err2)
 		fmt.Printf("Output: %s\n", string(output2))
 		os.Rename(asarPath+".backup", asarPath) // Restore on failure
-		return fmt.Errorf("repacking asar: %v\nOutput: %s", err, string(output2))
+		return fmt.Errorf("repacking asar: %v\nOutput: %s", err2, string(output2))
 	}
 	fmt.Printf("Repacking successful\n")
 
-	// Ad-hoc sign on macOS after all modifications
-	if runtime.GOOS == "darwin" {
-		fmt.Println("Signing app with ad-hoc signature...")
-		appPath := filepath.Join(AppFolder, "Claude.app")
-
-		// Remove existing signature first
-		cmd := exec.Command("codesign", "--remove-signature", appPath)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("Remove signature output: %s\n", string(output))
-			// Ignore errors, might not be signed
-		} else if len(output) > 0 {
-			fmt.Printf("Remove signature output: %s\n", string(output))
-		}
-
-		// Sign with ad-hoc signature
-		cmd = exec.Command("codesign", "--force", "--deep", "--sign", "-", appPath)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("Warning: Could not sign app: %v\n%s\n", err, string(output))
-			// Continue anyway - might still work
-		} else {
-			fmt.Printf("App signed successfully\n")
-			if len(output) > 0 {
-				fmt.Printf("Signing output: %s\n", string(output))
-			}
-		}
-	}
-
-	fmt.Println("Capturing hash mismatch...")
-	expectedHash, actualHash, err := captureHashMismatch()
-	if err != nil {
-		return fmt.Errorf("capturing hash: %v", err)
-	}
-
-	fmt.Printf("Expected hash: %s\n", expectedHash)
-	fmt.Printf("Actual hash: %s\n", actualHash)
-
-	fmt.Println("Patching exe...")
-	if err := replaceHashInExe(expectedHash, actualHash); err != nil {
-		return fmt.Errorf("patching exe: %v", err)
-	}
-
-	// Ad-hoc sign on macOS after all modifications
-	if runtime.GOOS == "darwin" {
-		fmt.Println("Signing app with ad-hoc signature...")
-		appPath := filepath.Join(AppFolder, "Claude.app")
-
-		// Remove existing signature first
-		cmd := exec.Command("codesign", "--remove-signature", appPath)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("Remove signature output: %s\n", string(output))
-			// Ignore errors, might not be signed
-		} else if len(output) > 0 {
-			fmt.Printf("Remove signature output: %s\n", string(output))
-		}
-
-		// Sign with ad-hoc signature
-		cmd = exec.Command("codesign", "--force", "--deep", "--sign", "-", appPath)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			fmt.Printf("Warning: Could not sign app: %v\n%s\n", err, string(output))
-			// Continue anyway - might still work
-		} else {
-			fmt.Printf("App signed successfully\n")
-			if len(output) > 0 {
-				fmt.Printf("Signing output: %s\n", string(output))
-			}
-		}
+	if err := finalizePatches(); err != nil {
+		return err
 	}
 
 	fmt.Println("Patches applied successfully!")
@@ -903,51 +716,7 @@ func applyPatches(version string) error {
 func replaceIcons() error {
 	fmt.Println("Replacing icons...")
 
-	// OS-specific exe/app icon replacement
-	switch runtime.GOOS {
-	case "windows":
-		// Extract rcedit.exe to temp file
-		rceditData, err := EmbeddedFS.ReadFile("resources/rcedit.exe")
-		if err != nil {
-			return fmt.Errorf("reading embedded rcedit.exe: %v", err)
-		}
-
-		tempRcedit := filepath.Join(os.TempDir(), "rcedit-temp.exe")
-		if err := os.WriteFile(tempRcedit, rceditData, 0755); err != nil {
-			return fmt.Errorf("writing temp rcedit.exe: %v", err)
-		}
-		defer os.Remove(tempRcedit)
-
-		// Extract app.ico to temp file
-		icoData, err := EmbeddedFS.ReadFile("resources/icons/app.ico")
-		if err != nil {
-			return fmt.Errorf("reading embedded app.ico: %v", err)
-		}
-
-		tempIco := filepath.Join(os.TempDir(), "app-temp.ico")
-		if err := os.WriteFile(tempIco, icoData, 0644); err != nil {
-			return fmt.Errorf("writing temp app.ico: %v", err)
-		}
-		defer os.Remove(tempIco)
-
-		cmd := exec.Command(tempRcedit, appExePath, "--set-icon", tempIco)
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("Warning: Could not replace exe icon: %v\n", err)
-		}
-	case "darwin":
-		// Replace the app bundle icon
-		icnsData, err := EmbeddedFS.ReadFile("resources/icons/app.icns")
-		if err == nil {
-			// electron.icns is in Claude.app/Contents/Resources/
-			targetPath := filepath.Join(AppFolder, "Claude.app", "Contents", "Resources", "electron.icns")
-
-			if err := os.WriteFile(targetPath, icnsData, 0644); err != nil {
-				fmt.Printf("Warning: Could not replace app icon: %v\n", err)
-			} else {
-				fmt.Println("  Replaced electron.icns")
-			}
-		}
-	}
+	replacePlatformAppIcon()
 
 	// Copy other icons (works for all platforms)
 	iconEntries, err := EmbeddedFS.ReadDir("resources/icons")
@@ -977,65 +746,4 @@ func replaceIcons() error {
 	}
 
 	return nil
-}
-
-func captureHashMismatch() (string, string, error) {
-	cmd := exec.Command(appExePath)
-	output, _ := cmd.CombinedOutput()
-
-	// Parse the error output for the hashes
-	// Looking for pattern: "Integrity check failed for asar archive (EXPECTED vs ACTUAL)"
-	outputStr := string(output)
-	fmt.Println(outputStr)
-	if strings.Contains(outputStr, "Integrity check failed") {
-		// Extract the hashes using a simple string parse
-		start := strings.Index(outputStr, "(")
-		end := strings.Index(outputStr, ")")
-		if start != -1 && end != -1 {
-			hashPart := outputStr[start+1 : end]
-			parts := strings.Split(hashPart, " vs ")
-			if len(parts) == 2 {
-				return parts[0], parts[1], nil
-			}
-		}
-	}
-
-	return "", "", fmt.Errorf("could not parse hash mismatch")
-}
-
-func replaceHashInExe(oldHash, newHash string) error {
-	if runtime.GOOS == "darwin" {
-		// On macOS, the hash is in Info.plist
-		plistPath := filepath.Join(AppFolder, "Claude.app", "Contents", "Info.plist")
-
-		// Read the plist
-		data, err := os.ReadFile(plistPath)
-		if err != nil {
-			return fmt.Errorf("reading Info.plist: %v", err)
-		}
-
-		// Replace the hash
-		replaced := bytes.Replace(data, []byte(oldHash), []byte(newHash), 1)
-		if bytes.Equal(replaced, data) {
-			return fmt.Errorf("hash not found in Info.plist")
-		}
-
-		// Write back
-		return os.WriteFile(plistPath, replaced, 0644)
-	} else {
-		// Windows - hash is in the executable
-		data, err := os.ReadFile(appExePath)
-		if err != nil {
-			return err
-		}
-
-		// Search for the hash as a string
-		replaced := bytes.Replace(data, []byte(oldHash), []byte(newHash), 1)
-		if bytes.Equal(replaced, data) {
-			return fmt.Errorf("hash not found in executable")
-		}
-
-		// Write back
-		return os.WriteFile(appExePath, replaced, 0755)
-	}
 }
